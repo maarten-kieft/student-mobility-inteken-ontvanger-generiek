@@ -1,9 +1,13 @@
 package generiek.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Expiry;
 import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.proc.BadJOSEException;
 import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.JWTParser;
 import com.nimbusds.openid.connect.sdk.OIDCClaimsRequest;
 import com.nimbusds.openid.connect.sdk.claims.ClaimsSetRequest;
 import generiek.LanguageFilter;
@@ -28,6 +32,7 @@ import okhttp3.ConnectionPool;
 import okhttp3.OkHttpClient;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.bouncycastle.oer.its.etsi102941.EnrolmentRequestMessage;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.*;
@@ -53,6 +58,7 @@ import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.text.ParseException;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -84,6 +90,34 @@ public class EnrollmentEndpoint {
     private final ParameterizedTypeReference<Map<String, Object>> mapRef = new ParameterizedTypeReference<Map<String, Object>>() {
     };
     private final JWTValidator jwtValidator;
+
+    private final Cache<String, String> accessTokenCache = Caffeine.newBuilder()
+            .expireAfter(new Expiry<String, String>() {
+                @Override
+                public long expireAfterCreate(String key, String token, long currentTime) {
+                    try {
+                        JWTClaimsSet claims = JWTParser.parse(token).getJWTClaimsSet();
+                        long expSeconds = claims.getExpirationTime().toInstant().getEpochSecond();
+                        long nowSeconds = Instant.now().getEpochSecond();
+                        long secondsUntilExpiry =  Math.max(expSeconds - nowSeconds, 0);
+                        long cappedSeconds = Math.min(secondsUntilExpiry, 600); // max 10 min
+                        return TimeUnit.SECONDS.toNanos(cappedSeconds);
+                    } catch (Exception e) {
+                        return 0;
+                    }
+                }
+
+                @Override
+                public long expireAfterUpdate(String key, String token, long currentTime, long currentDuration) {
+                    return expireAfterCreate(key, token, currentTime);
+                }
+
+                @Override
+                public long expireAfterRead(String key, String token, long currentTime, long currentDuration) {
+                    return currentDuration;
+                }
+            })
+            .build();
 
     public EnrollmentEndpoint(@Value("${oidc.acr-context-class-ref}") String acr,
                               @Value("${oidc.client-id}") String clientId,
@@ -243,7 +277,7 @@ public class EnrollmentEndpoint {
         if (this.eduIDRequired) {
             enrollmentRequest.setEduid(eduid);
         }
-        enrollmentRequest.setAccessToken(accessToken);
+        accessTokenCache.put(enrollmentRequest.getIdentifier(), accessToken);
         enrollmentRequest.setRefreshToken(refreshToken);
         enrollmentRepository.save(enrollmentRequest);
 
@@ -721,9 +755,20 @@ public class EnrollmentEndpoint {
                                                                           HttpMethod httpMethod,
                                                                           boolean returnHttpStatusOk,
                                                                           boolean retry) {
+
+        var refreshAccessToken = !retry;
+        String accessToken = null;
+
+        try{
+            accessToken = resolveAccessToken(enrollmentRequest, refreshAccessToken);
+        } catch (HttpStatusCodeException e2) {
+            return this.errorResponseEntity("Error in obtaining new accessToken with saved refreshToken for enrolment request:" + enrollmentRequest, e2);
+        }
+
         HttpHeaders httpHeaders = getOidcAuthorizationHttpHeaders(
-                enrollmentRequest.getAccessToken(),
-                PersonAuthentication.HEADER.name());
+                accessToken,
+                PersonAuthentication.HEADER.name()
+        );
         HttpEntity<Map<String, Object>> requestEntity = new HttpEntity(body, httpHeaders);
 
         try {
@@ -735,12 +780,7 @@ public class EnrollmentEndpoint {
                     .body(exchanged.getBody());
         } catch (HttpStatusCodeException e) {
             if (retry) {
-                try {
-                    EnrollmentRequest refreshedEnrollmentRequest = refreshTokens(enrollmentRequest);
-                    return exchangeToHomeInstitution(refreshedEnrollmentRequest, body, uri, httpMethod, returnHttpStatusOk, false);
-                } catch (HttpStatusCodeException e2) {
-                    return this.errorResponseEntity("Error in obtaining new accessToken with saved refreshToken for enrolment request:" + enrollmentRequest, e2);
-                }
+                return exchangeToHomeInstitution(enrollmentRequest, body, uri, httpMethod, returnHttpStatusOk, false);
             } else {
                 return this.errorResponseEntity(String.format("Error %s from the OOAPI endpoint %s for enrolment request: %s.",
                         e.getStatusCode(),
@@ -748,28 +788,6 @@ public class EnrollmentEndpoint {
                         enrollmentRequest), e);
             }
         }
-    }
-
-    private EnrollmentRequest refreshTokens(EnrollmentRequest enrollmentRequest) {
-        LOG.debug("Obtaining new accessToken with saved refreshToken for enrolment request: " + enrollmentRequest);
-
-        MultiValueMap<String, String> map = new LinkedMultiValueMap<>();
-        map.add("client_id", clientId);
-        map.add("client_secret", clientSecret);
-        map.add("grant_type", "refresh_token");
-        map.add("refresh_token", enrollmentRequest.getRefreshToken());
-
-        Map<String, Object> oidcResponse = tokenRequest(map);
-        String accessToken = (String) oidcResponse.get("access_token");
-        String refreshToken = (String) oidcResponse.get("refresh_token");
-
-        //If all went well, save the new access token and refresh token in the enrollment request
-        enrollmentRequest.setAccessToken(accessToken);
-        enrollmentRequest.setRefreshToken(refreshToken);
-
-        enrollmentRepository.save(enrollmentRequest);
-
-        return enrollmentRequest;
     }
 
     private ResponseEntity<Map<String, Object>> errorResponseEntity(String description, HttpStatusCodeException e) {
@@ -789,14 +807,14 @@ public class EnrollmentEndpoint {
 
     private Map<String, Object> person(EnrollmentRequest enrollmentRequest) {
         String personAuth = enrollmentRequest.getPersonAuth();
-        HttpHeaders httpHeaders = getOidcAuthorizationHttpHeaders(
-                enrollmentRequest.getAccessToken(), personAuth);
+        String accessToken = resolveAccessToken(enrollmentRequest);
+        HttpHeaders httpHeaders = getOidcAuthorizationHttpHeaders(accessToken, personAuth);
 
         LOG.debug("Retrieve person information from : " + enrollmentRequest.getPersonURI() + " using personAuth; " + personAuth);
 
         if (personAuth.equalsIgnoreCase(PersonAuthentication.FORM.name())) {
             MultiValueMap<String, String> map = new LinkedMultiValueMap<>();
-            map.add("access_token", enrollmentRequest.getAccessToken());
+            map.add("access_token", accessToken);
             HttpEntity<MultiValueMap<String, String>> requestEntity = new HttpEntity<>(map, httpHeaders);
             return restTemplate.exchange(enrollmentRequest.getPersonURI(), HttpMethod.POST, requestEntity, mapRef).getBody();
         } else {
@@ -858,4 +876,33 @@ public class EnrollmentEndpoint {
         }
     }
 
+    private String resolveAccessToken(EnrollmentRequest enrollmentRequest) {
+        return resolveAccessToken(enrollmentRequest, false);
+    }
+
+    private String resolveAccessToken(EnrollmentRequest enrollmentRequest, boolean forceRefresh){
+        if(forceRefresh){
+            accessTokenCache.invalidate(enrollmentRequest.getIdentifier());
+        }
+
+        return accessTokenCache.get(enrollmentRequest.getIdentifier(), key -> {
+            LOG.debug("Obtaining new accessToken with saved refreshToken for enrolment request: " + enrollmentRequest);
+
+            MultiValueMap<String, String> map = new LinkedMultiValueMap<>();
+            map.add("client_id", clientId);
+            map.add("client_secret", clientSecret);
+            map.add("grant_type", "refresh_token");
+            map.add("refresh_token", enrollmentRequest.getRefreshToken());
+
+            Map<String, Object> oidcResponse = tokenRequest(map);
+            String accessToken = (String) oidcResponse.get("access_token");
+            String refreshToken = (String) oidcResponse.get("refresh_token");
+
+            enrollmentRequest.setRefreshToken(refreshToken);
+
+            enrollmentRepository.save(enrollmentRequest);
+
+            return accessToken;
+        });
+    }
 }

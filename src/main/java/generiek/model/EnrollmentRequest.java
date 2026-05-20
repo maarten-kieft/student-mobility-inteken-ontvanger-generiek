@@ -58,9 +58,6 @@ public class EnrollmentRequest implements Serializable {
     private String eduid;
 
     @Column
-    private String accessToken;
-
-    @Column
     private String refreshToken;
 
     @Column
@@ -112,7 +109,6 @@ public class EnrollmentRequest implements Serializable {
                 ", personAuth=" + this.getPersonAuth() +
                 ", associations=" + this.getAssociations() +
                 ", eduid=" + this.getEduid() +
-                ", accessToken=" + StringUtils.hasText(this.getAccessToken()) +
                 ", refreshToken=" + StringUtils.hasText(this.getRefreshToken()) +
                 ", scope=" + this.getScope() +
                 ", created=" + this.getCreated() + ")";

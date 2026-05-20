@@ -590,6 +590,43 @@ public class EnrollmentEndpointTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void accessTokenNotStoredInDatabaseAndNotRefetchedOnSubsequentCalls() throws Exception {
+        String state = doAuthorize(PersonAuthentication.HEADER.name());
+        String correlationId = doToken(state); // calls /oidc/token once
+
+        stubFor(post(urlPathMatching("/api/associations-uri")).willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(objectMapper.writeValueAsString(singletonMap("associationsURI", "http://localhost:8081/associations")))));
+        stubFor(post(urlPathMatching("/associations/external/me")).willReturn(aResponse()
+                .withStatus(201)
+                .withBody(readFile("data/association_me.json"))
+                .withHeader("Content-Type", "application/json")));
+
+        EnrollmentRequest enrollmentRequest = enrollmentRepository.findByIdentifier(correlationId).get();
+
+        // First call
+        given().when()
+                .contentType(ContentType.JSON).accept(ContentType.JSON)
+                .auth().basic("sis", "secret")
+                .body(new HashMap<>())
+                .pathParam("personId", enrollmentRequest.getEduid())
+                .post("/associations/external/{personId}")
+                .then().statusCode(201);
+
+        // Second call — token must be reused, no extra fetch
+        given().when()
+                .contentType(ContentType.JSON).accept(ContentType.JSON)
+                .auth().basic("sis", "secret")
+                .body(new HashMap<>())
+                .pathParam("personId", enrollmentRequest.getEduid())
+                .post("/associations/external/{personId}")
+                .then().statusCode(201);
+
+        // Token endpoint must have been called exactly once (during doToken, not during the two API calls)
+        verify(exactly(1), postRequestedFor(urlPathMatching("/oidc/token")));
+    }
+
+    @Test
     void registrationBrokerException() throws Exception {
         String state = doAuthorize(PersonAuthentication.HEADER.name());
         String correlationId = doToken(state);
